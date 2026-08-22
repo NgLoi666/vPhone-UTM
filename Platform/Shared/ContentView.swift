@@ -19,24 +19,14 @@ import UniformTypeIdentifiers
 #if os(iOS)
 import IQKeyboardManagerSwift
 #endif
-import TipKit
 
-// on visionOS, there is no text to show more than UTM
-#if WITH_QEMU_TCI && !os(visionOS)
-let productName = "UTM SE"
-#elseif WITH_REMOTE && !os(visionOS)
-let productName = "UTM Remote"
-#else
-let productName = "UTM"
-#endif
+let productName = "vPhone"
 
 struct ContentView: View {
     @State private var editMode = false
     @EnvironmentObject private var data: UTMData
-    @StateObject private var releaseHelper = UTMReleaseHelper()
     @State private var openSheetPresented = false
     @Environment(\.openURL) var openURL
-    @AppStorage("ServerAutostart") private var isServerAutostart: Bool = false
 
     var body: some View {
         VMNavigationListView()
@@ -45,19 +35,6 @@ struct ContentView: View {
         .frame(minWidth: 800, idealWidth: 1200, minHeight: 600, idealHeight: 800)
         #endif
         .disabled(data.busy && !data.showNewVMSheet && !data.showSettingsModal)
-        .sheet(isPresented: $releaseHelper.isReleaseNotesShown, onDismiss: {
-            releaseHelper.closeReleaseNotes()
-            if #available(iOS 17, macOS 14, *) {
-                UTMTipCreateVM.isVMListEmpty = data.virtualMachines.count == 0
-            }
-        }, content: {
-            VMReleaseNotesView(helper: releaseHelper).padding()
-        })
-        .onReceive(NSNotification.ShowReleaseNotes) { _ in
-            Task {
-                await releaseHelper.fetchReleaseNotes(force: true)
-            }
-        }
         .onOpenURL(perform: handleURL)
         .handlesExternalEvents(preferring: ["*"], allowing: ["*"])
         .onReceive(NSNotification.NewVirtualMachine) { _ in
@@ -85,18 +62,6 @@ struct ContentView: View {
         .onAppear {
             Task {
                 await data.listRefresh()
-                await releaseHelper.fetchReleaseNotes()
-                if #available(iOS 17, macOS 14, *) {
-                    if !releaseHelper.isReleaseNotesShown {
-                        UTMTipCreateVM.isVMListEmpty = data.virtualMachines.count == 0
-                        UTMTipDonate.timesLaunched += 1
-                    }
-                }
-                #if os(macOS)
-                if isServerAutostart {
-                    await data.remoteServer.start()
-                }
-                #endif
             }
             #if os(macOS)
             NSWindow.allowsAutomaticWindowTabbing = false
@@ -130,17 +95,6 @@ struct ContentView: View {
             #endif
             #endif
         }
-        #if WITH_SERVER
-        .onChange(of: isServerAutostart) { newValue in
-            if newValue {
-                Task {
-                    if isServerAutostart && !data.remoteServer.state.isServerActive {
-                        await data.remoteServer.start()
-                    }
-                }
-            }
-        }
-        #endif
     }
     
     private func handleURL(url: URL) {

@@ -1,5 +1,28 @@
-#  UTM
-[![Build](https://github.com/utmapp/UTM/workflows/Build/badge.svg?branch=main&event=push)][1]
+# vPhone-UTM
+
+A personal fork of [UTM](https://github.com/utmapp/UTM) rebuilt into a dedicated macOS frontend for
+[vphone-cli](https://github.com/MakrSas/vphone-cli-modded) — booting a virtual iPhone via Apple's
+Virtualization.framework instead of the general-purpose QEMU/UTM VM manager this project started as.
+
+## What's different from upstream UTM
+
+- **The VM-creation wizard drives `vphone-cli` end-to-end** instead of the generic multi-OS wizard —
+  `Platform/macOS/VMWizardView.swift` was rewritten from the OS-picker/hardware/drives/sharing flow
+  into a 4-step flow (identity → resources → firmware → provisioning) that shells out to
+  `vphone-cli vm create` and streams its progress live in the window.
+- **A dedicated "Virtual iPhone" settings sheet** (`Platform/macOS/VMSettingsView.swift`) — sidebar +
+  detail layout with General/Hardware/Network/SSH/Advanced/Notes pages, freely add/remove custom
+  key-value fields directly in the sidebar, and RAM editing on already-created VMs.
+- **Fix: `vm create` launched via `do shell script … with administrator privileges` (as the GUI
+  must, to grant the private virtualization entitlements) used to hang forever on "trying to
+  authorize"** — the underlying CLI streamed its progress by checking `isatty(STDOUT_FILENO)`, which
+  is always false when driven from a GUI through a pipe. Fixed on the CLI side
+  ([vphone-cli-modded](https://github.com/MakrSas/vphone-cli-modded)); this repo's `UTMVirtualMachine`
+  also gained AMFI self-heal (auto-retries once via `amfidont` if the CLI gets killed by AMFI on an
+  ad-hoc-signed private-entitlement binary).
+- **New app icon.**
+
+## About UTM
 
 > It is possible to invent a single machine which can be used to compute any computable sequence.
 

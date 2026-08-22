@@ -50,26 +50,16 @@ struct UTMApp: App {
         }.commands {
             VMCommands()
         }
-        Settings {
-            SettingsView()
-        }
     }
     
     @available(macOS 13, *)
     @SceneBuilder
     var newBody: some Scene {
-        Window("UTM Library", id: "home") {
+        Window("vPhone Library", id: "home") {
             homeWindow
-                .navigationTitle("UTM")
+                .navigationTitle("vPhone")
         }.commands {
             VMCommands()
-        }
-        Settings {
-            SettingsView()
-        }
-        UTMMenuBarExtraScene(data: data)
-        Window("UTM Server", id: "server") {
-            UTMServerView().environmentObject(data.remoteServer.state)
         }
     }
     

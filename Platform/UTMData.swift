@@ -156,38 +156,55 @@ enum AlertItem: Identifiable {
                 list[i] = VMData(from: registryEntry)
             }
         }
-        // now look for and add new VMs in default storage
+        // Look for UTM bundles and native vphone-cli bundles in their respective libraries.
         do {
-            let files = try fileManager.contentsOfDirectory(at: UTMData.defaultStorageUrl, includingPropertiesForKeys: [.isDirectoryKey, .fileResourceIdentifierKey], options: .skipsHiddenFiles)
-            let newFiles = files.filter { newFile in
-                !list.contains { existingVM in
-                    isSameFile(existingVM.pathUrl, as: newFile)
-                }
+            #if os(macOS)
+            var roots: [URL] = []
+            let vphoneRoot = VPhoneVirtualMachine.libraryRoot
+            if !fileManager.fileExists(atPath: vphoneRoot.path) {
+                try? fileManager.createDirectory(at: vphoneRoot, withIntermediateDirectories: true)
             }
-            for file in newFiles {
-                guard try file.resourceValues(forKeys: [.isDirectoryKey]).isDirectory ?? false else {
-                    continue
-                }
-                guard ConcreteVirtualMachine.isVirtualMachine(url: file) else {
-                    continue
-                }
-                await Task.yield()
-                if let vm = try? VMData(url: file) {
-                    if uuidHasCollision(with: vm, in: list) {
-                        if let index = list.firstIndex(where: { !$0.isLoaded && $0.id == vm.id }) {
-                            // we have a stale VM with the same UUID, so we replace that entry with this one
-                            list[index] = vm
-                            // update the registry with the new bookmark
-                            try? await vm.wrapped!.updateRegistryFromConfig()
-                            continue
-                        } else {
-                            // duplicate is not stale so we need a new UUID
-                            uuidRegenerate(for: vm)
-                        }
+            roots.append(vphoneRoot)
+            #else
+            let roots = [UTMData.defaultStorageUrl]
+            #endif
+            for root in roots {
+                let files = try fileManager.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isDirectoryKey, .fileResourceIdentifierKey], options: .skipsHiddenFiles)
+                let newFiles = files.filter { newFile in
+                    !list.contains { existingVM in
+                        isSameFile(existingVM.pathUrl, as: newFile)
                     }
-                    list.insert(vm, at: 0)
-                } else {
-                    logger.error("Failed to create object for \(file)")
+                }
+                for file in newFiles {
+                    guard try file.resourceValues(forKeys: [.isDirectoryKey]).isDirectory ?? false else {
+                        continue
+                    }
+                    #if os(macOS)
+                    let isVPhone = root.standardizedFileURL == VPhoneVirtualMachine.libraryRoot.standardizedFileURL && VPhoneVirtualMachine.isVirtualMachine(url: file)
+                    #else
+                    let isVPhone = false
+                    #endif
+                    guard ConcreteVirtualMachine.isVirtualMachine(url: file) || isVPhone else {
+                        continue
+                    }
+                    await Task.yield()
+                    if let vm = try? VMData(url: file) {
+                        if uuidHasCollision(with: vm, in: list) {
+                            if let index = list.firstIndex(where: { !$0.isLoaded && $0.id == vm.id }) {
+                                // we have a stale VM with the same UUID, so we replace that entry with this one
+                                list[index] = vm
+                                // update the registry with the new bookmark
+                                try? await vm.wrapped!.updateRegistryFromConfig()
+                                continue
+                            } else {
+                                // duplicate is not stale so we need a new UUID
+                                uuidRegenerate(for: vm)
+                            }
+                        }
+                        list.insert(vm, at: 0)
+                    } else {
+                        logger.error("Failed to create object for \(file)")
+                    }
                 }
             }
         } catch {
@@ -497,6 +514,16 @@ enum AlertItem: Identifiable {
     /// - Parameter vm: VM to delete
     /// - Returns: Index of item removed in VM list or nil if not in list
     @discardableResult func delete(vm: VMData, alsoRegistry: Bool = true) async throws -> Int? {
+        #if os(macOS)
+        if let vphoneVM = vm.wrapped as? VPhoneVirtualMachine {
+            try await vphoneVM.deleteFromLibrary()
+            close(vm: vm)
+            if alsoRegistry, let registryEntry = vm.registryEntry {
+                UTMRegistry.shared.remove(entry: registryEntry)
+            }
+            return listRemove(vm: vm)
+        }
+        #endif
         if vm.isLoaded {
             try fileManager.removeItem(at: vm.pathUrl)
         }
@@ -514,6 +541,21 @@ enum AlertItem: Identifiable {
     /// - Parameter vm: VM to clone
     /// - Returns: The new VM
     @discardableResult func clone(vm: VMData) async throws -> VMData {
+        #if os(macOS)
+        if let vphoneVM = vm.wrapped as? VPhoneVirtualMachine {
+            let newName = newDefaultVMName(base: vphoneVM.config.information.name)
+            try await vphoneVM.clone(to: newName)
+            let newPath = VPhoneVirtualMachine.virtualMachinePath(for: newName, in: VPhoneVirtualMachine.libraryRoot)
+            guard let newVM = try? VMData(url: newPath) else {
+                throw UTMDataError.cloneFailed
+            }
+            var index = virtualMachines.firstIndex(of: vm)
+            if index != nil { index! += 1 }
+            listAdd(vm: newVM, at: index)
+            listSelect(vm: newVM)
+            return newVM
+        }
+        #endif
         let newName: String = newDefaultVMName(base: vm.detailsTitleLabel)
         let newPath = ConcreteVirtualMachine.virtualMachinePath(for: newName, in: documentsURL)
         let isRegenerateMACOnClone = UserDefaults.standard.bool(forKey: "IsRegenerateMACOnClone")

@@ -42,8 +42,6 @@ fileprivate struct VMPlaceholderViewOld: View {
 
 @available(iOS 16, macOS 13, *)
 fileprivate struct VMPlaceholderViewNew: View {
-    @Environment(\.openWindow) private var openWindow
-
     var body: some View {
         VStack {
             Title()
@@ -54,15 +52,6 @@ fileprivate struct VMPlaceholderViewNew: View {
                 GridRow {
                     SecondRow()
                 }
-                #if os(macOS)
-                GridRow {
-                    TileButton(Label(String.server, systemImage: "server.rack"), width: nil, height: 50, compact: true) {
-                        openWindow(id: "server")
-                    }
-                    .gridCellColumns(2)
-                    .gridCellUnsizedAxes(.horizontal)
-                }
-                #endif
             }
         }
     }
@@ -71,7 +60,7 @@ fileprivate struct VMPlaceholderViewNew: View {
 fileprivate struct Title: View {
     var body: some View {
         HStack {
-            Text("Welcome to UTM").font(.title)
+            Text("Welcome to vPhone").font(.title)
         }
     }
 }
@@ -84,8 +73,8 @@ fileprivate struct FirstRow: View {
         TileButton(Label(String.create, systemImage: "plus.circle")) {
             data.newVM()
         }
-        TileButton(Label(String.browse, systemImage: "arrow.down.circle")) {
-            openURL(URL(string: "https://mac.getutm.app/gallery/")!)
+        TileButton(Label(String.browse, systemImage: "iphone")) {
+            openURL(URL(string: "https://github.com/Lakr233/vphone-cli")!)
         }
     }
 }
@@ -95,20 +84,19 @@ fileprivate struct SecondRow: View {
 
     var body: some View {
         TileButton(Label(String.guide, systemImage: "book.circle")) {
-            openURL(URL(string: "https://docs.getutm.app/basics/basics/")!)
+            openURL(URL(string: "https://github.com/Lakr233/vphone-cli#readme")!)
         }
         TileButton(Label(String.support, systemImage: "questionmark.circle")) {
-            openURL(URL(string: "https://docs.getutm.app/")!)
+            openURL(URL(string: "https://github.com/Lakr233/vphone-cli/issues")!)
         }
     }
 }
 
 fileprivate extension String {
-    static let create = NSLocalizedString("Create a New Virtual Machine", comment: "Welcome view")
-    static let browse = NSLocalizedString("Browse UTM Gallery", comment: "Welcome view")
+    static let create = NSLocalizedString("Create a New Virtual iPhone", comment: "Welcome view")
+    static let browse = NSLocalizedString("vphone-cli", comment: "Welcome view")
     static let guide = NSLocalizedString("User Guide", comment: "Welcome view")
     static let support = NSLocalizedString("Support", comment: "Welcome view")
-    static let server = NSLocalizedString("Server", comment: "Server view")
 }
 
 private struct TileButton: View {

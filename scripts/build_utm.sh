@@ -72,6 +72,8 @@ fi
 
 xcodebuild archive -archivePath "$OUTPUT" -scheme "$SCHEME" -sdk "$SDK" $ARCH_ARGS -configuration Release CODE_SIGNING_ALLOWED=NO $TEAM_IDENTIFIER_PREFIX
 BUILT_PATH=$(find $OUTPUT.xcarchive -name '*.app' -type d | head -1)
+APP_NAME=$(basename "$BUILT_PATH" .app)
+MAIN_EXECUTABLE="$BUILT_PATH/Contents/MacOS/$APP_NAME"
 # Only retain the target architecture to address < iOS 15 crash & save disk space
 if [ "$SDK" == "iphoneos" ]; then
     find "$BUILT_PATH" -type f -path '*/Frameworks/*.dylib' | while read FILE; do
@@ -112,10 +114,38 @@ if [ "$SDK" == "macosx" ]; then
     codesign --force --sign - --entitlements "$RENDERER_ENTITLEMENTS" --timestamp=none --options runtime "$BUILT_PATH/Contents/XPCServices/QEMUHelper.xpc/Contents/MacOS/QEMURenderServer.app/Contents/MacOS/QEMURenderServer"
     codesign --force --sign - --entitlements "$HELPER_ENTITLEMENTS" --timestamp=none --options runtime "$BUILT_PATH/Contents/XPCServices/QEMUHelper.xpc/Contents/MacOS/QEMUHelper"
     codesign --force --sign - --entitlements "$CLI_ENTITLEMENTS" --timestamp=none --options runtime "$BUILT_PATH/Contents/MacOS/utmctl"
-    codesign --force --sign - --entitlements "$UTM_ENTITLEMENTS" --timestamp=none --options runtime "$BUILT_PATH/Contents/MacOS/UTM"
+    codesign --force --sign - --entitlements "$UTM_ENTITLEMENTS" --timestamp=none --options runtime "$MAIN_EXECUTABLE"
     rm "$UTM_ENTITLEMENTS"
     rm "$LAUNCHER_ENTITLEMENTS"
     rm "$RENDERER_ENTITLEMENTS"
     rm "$HELPER_ENTITLEMENTS"
     rm "$CLI_ENTITLEMENTS"
+
+    # Keep a directly openable .app next to the archive. The output base path
+    # stays stable across rebuilds, so a Finder alias or Dock item keeps working.
+    BUILT_APP_OUTPUT="${OUTPUT}.app"
+    rm -rf "$BUILT_APP_OUTPUT"
+    ditto "$BUILT_PATH" "$BUILT_APP_OUTPUT"
+    echo "Application: $BUILT_APP_OUTPUT"
+
+    LATEST_APP_OUTPUT="$BASEDIR/../.build/vPhone.app"
+    rm -rf "$LATEST_APP_OUTPUT"
+    ditto "$BUILT_PATH" "$LATEST_APP_OUTPUT"
+    # The archive is prepared with sandbox entitlements for Xcode/export.
+    # For direct local Finder launching, use an ad-hoc signed, unsandboxed copy.
+    codesign --force --deep --sign - --timestamp=none --options runtime "$LATEST_APP_OUTPUT"
+    # usbredirhost is an independently signed bundled framework. Disable
+    # library validation only for this local, ad-hoc build so Finder can
+    # launch it on the user's development Mac.
+    codesign --force --sign - --entitlements "$BASEDIR/../Platform/macOS/local-launch.entitlements" --timestamp=none --options runtime "$LATEST_APP_OUTPUT"
+    codesign --verify --deep --strict "$LATEST_APP_OUTPUT"
+    xattr -dr com.apple.quarantine "$LATEST_APP_OUTPUT" 2>/dev/null || true
+    echo "Stable application: $LATEST_APP_OUTPUT"
+
+    # Keep the old technical name as a compatibility copy, but use vPhone.app
+    # for Finder/manual launching so the bundle name stays stable.
+    LEGACY_APP_OUTPUT="$BASEDIR/../.build/vPhone-latest.app"
+    rm -rf "$LEGACY_APP_OUTPUT"
+    ditto "$LATEST_APP_OUTPUT" "$LEGACY_APP_OUTPUT"
+    echo "Compatibility application: $LEGACY_APP_OUTPUT"
 fi

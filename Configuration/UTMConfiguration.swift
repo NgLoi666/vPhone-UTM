@@ -15,6 +15,7 @@
 //
 
 import Foundation
+import Combine
 
 private let kUTMBundleConfigFilename = "config.plist"
 
@@ -44,6 +45,7 @@ enum UTMBackend: String, CaseIterable, Codable {
     case unknown = "Unknown"
     case apple = "Apple"
     case qemu = "QEMU"
+    case vphone = "vPhone"
 }
 
 enum UTMConfigurationError: Error {
@@ -133,6 +135,12 @@ extension UTMConfiguration {
             #else
             throw UTMConfigurationError.invalidBackend
             #endif
+        } else if stub.backend == .vphone {
+            #if os(macOS)
+            return try decoder.decode(VPhoneConfiguration.self, from: configData)
+            #else
+            throw UTMConfigurationError.invalidBackend
+            #endif
         } else {
             throw UTMConfigurationError.invalidBackend
         }
@@ -210,3 +218,150 @@ extension UTMConfiguration {
         }.value
     }
 }
+
+// MARK: - vPhone metadata
+
+/// UI metadata stored alongside a vphone-cli bundle.
+///
+/// vphone-cli owns `config.plist` in the bundle, so this configuration deliberately
+/// uses its own sidecar file and never writes to the firmware manifest.
+#if os(macOS)
+final class VPhoneConfiguration: UTMConfiguration {
+    typealias Drive = UTMQemuConfigurationDrive
+
+    static let metadataFilename = ".vphone-utm.plist"
+
+    @Published var information: UTMConfigurationInfo
+    @Published var cpuCount: Int
+    @Published var memorySizeMib: Int
+    @Published var diskSizeGib: Int
+    @Published var networkMode: String
+    @Published var variant: String
+    @Published var iphoneSource: URL?
+    @Published var cloudOSSource: URL?
+    @Published var drives: [UTMQemuConfigurationDrive]
+
+    /// Create-time-only `vm create` flags — vphone-cli's `vm config` cannot
+    /// change these on an existing VM (see VPhoneVMConfigCommand), so the
+    /// settings UI shows them read-only once the bundle already exists.
+    @Published var enableFrida: Bool
+    @Published var forceDSCMaxSlide: Bool
+    @Published var spoofBuild: String
+    @Published var keepArtifacts: Bool
+
+    /// Free-form user-defined notes, distinct from `information.notes` — an
+    /// ordered list so the user can add/remove/rename entries themselves.
+    @Published var customFields: [VPhoneCustomField]
+
+    /// Transient UI state for a newly-created virtual iPhone. This is deliberately
+    /// not encoded: an existing VM must never start the firmware pipeline again
+    /// just because its settings are saved.
+    var provisioningController: VPhoneProvisioningController?
+    var replaceIncompleteBundleOnSave = false
+
+    var backend: UTMBackend { .vphone }
+
+    init(name: String = "Virtual iPhone", cpuCount: Int = 8, memorySizeMib: Int = 8192,
+         diskSizeGib: Int = 64, networkMode: String = "nat", variant: String = "regular",
+         iphoneSource: URL? = nil, cloudOSSource: URL? = nil) {
+        var information = UTMConfigurationInfo()
+        information.name = name
+        self.information = information
+        self.cpuCount = cpuCount
+        self.memorySizeMib = memorySizeMib
+        self.diskSizeGib = diskSizeGib
+        self.networkMode = networkMode
+        self.variant = variant
+        self.iphoneSource = iphoneSource
+        self.cloudOSSource = cloudOSSource
+        self.drives = []
+        self.enableFrida = false
+        self.forceDSCMaxSlide = false
+        self.spoofBuild = ""
+        self.keepArtifacts = false
+        self.customFields = []
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case backend = "Backend"
+        case configurationVersion = "ConfigurationVersion"
+        case information = "Information"
+        case cpuCount = "CPU"
+        case memorySizeMib = "Memory"
+        case diskSizeGib = "Disk"
+        case networkMode = "Network"
+        case variant = "Variant"
+        case iphoneSource = "iPhoneSource"
+        case cloudOSSource = "CloudOSSource"
+        case enableFrida = "EnableFrida"
+        case forceDSCMaxSlide = "ForceDSCMaxSlide"
+        case spoofBuild = "SpoofBuild"
+        case keepArtifacts = "KeepArtifacts"
+        case customFields = "CustomFields"
+    }
+
+    required init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        information = try values.decode(UTMConfigurationInfo.self, forKey: .information)
+        cpuCount = try values.decodeIfPresent(Int.self, forKey: .cpuCount) ?? 8
+        memorySizeMib = try values.decodeIfPresent(Int.self, forKey: .memorySizeMib) ?? 8192
+        diskSizeGib = try values.decodeIfPresent(Int.self, forKey: .diskSizeGib) ?? 64
+        networkMode = try values.decodeIfPresent(String.self, forKey: .networkMode) ?? "nat"
+        variant = try values.decodeIfPresent(String.self, forKey: .variant) ?? "regular"
+        iphoneSource = try values.decodeIfPresent(URL.self, forKey: .iphoneSource)
+        cloudOSSource = try values.decodeIfPresent(URL.self, forKey: .cloudOSSource)
+        drives = []
+        enableFrida = try values.decodeIfPresent(Bool.self, forKey: .enableFrida) ?? false
+        forceDSCMaxSlide = try values.decodeIfPresent(Bool.self, forKey: .forceDSCMaxSlide) ?? false
+        spoofBuild = try values.decodeIfPresent(String.self, forKey: .spoofBuild) ?? ""
+        keepArtifacts = try values.decodeIfPresent(Bool.self, forKey: .keepArtifacts) ?? false
+        customFields = try values.decodeIfPresent([VPhoneCustomField].self, forKey: .customFields) ?? []
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(backend, forKey: .backend)
+        try values.encode(Self.currentVersion, forKey: .configurationVersion)
+        try values.encode(information, forKey: .information)
+        try values.encode(cpuCount, forKey: .cpuCount)
+        try values.encode(memorySizeMib, forKey: .memorySizeMib)
+        try values.encode(diskSizeGib, forKey: .diskSizeGib)
+        try values.encode(networkMode, forKey: .networkMode)
+        try values.encode(variant, forKey: .variant)
+        try values.encodeIfPresent(iphoneSource, forKey: .iphoneSource)
+        try values.encodeIfPresent(cloudOSSource, forKey: .cloudOSSource)
+        try values.encode(enableFrida, forKey: .enableFrida)
+        try values.encode(forceDSCMaxSlide, forKey: .forceDSCMaxSlide)
+        try values.encode(spoofBuild, forKey: .spoofBuild)
+        try values.encode(keepArtifacts, forKey: .keepArtifacts)
+        try values.encode(customFields, forKey: .customFields)
+    }
+
+    func prepareSave(for packageURL: URL) async throws {
+    }
+
+    func saveData(to dataURL: URL) async throws -> [URL] {
+        []
+    }
+
+    static func loadMetadata(from bundleURL: URL) throws -> VPhoneConfiguration {
+        let data = try Data(contentsOf: bundleURL.appendingPathComponent(metadataFilename))
+        return try PropertyListDecoder().decode(VPhoneConfiguration.self, from: data)
+    }
+
+    func saveMetadata(to bundleURL: URL) throws {
+        let encoder = PropertyListEncoder()
+        encoder.outputFormat = .xml
+        try encoder.encode(self).write(to: bundleURL.appendingPathComponent(Self.metadataFilename))
+    }
+}
+
+/// A single user-defined note attached to a virtual iPhone — purely
+/// informational (not read by vphone-cli), so the user can annotate a VM
+/// with whatever they want without waiting on new first-class settings.
+struct VPhoneCustomField: Codable, Identifiable, Hashable {
+    var id = UUID()
+    var key: String = ""
+    var value: String = ""
+}
+#endif

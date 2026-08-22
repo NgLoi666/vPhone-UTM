@@ -146,6 +146,9 @@ import SwiftUI
         if let appleConfig = config as? UTMAppleConfiguration {
             wrapped = try UTMAppleVirtualMachine(newForConfiguration: appleConfig, destinationUrl: destinationUrl)
         }
+        if let vphoneConfig = config as? VPhoneConfiguration {
+            wrapped = try VPhoneVirtualMachine(newForConfiguration: vphoneConfig, destinationUrl: destinationUrl)
+        }
         #endif
         subscribeToChildren()
     }
@@ -169,7 +172,18 @@ import SwiftUI
             return
         }
         var loaded: (any UTMVirtualMachine)?
-        let config = try UTMQemuConfiguration.load(from: url)
+        #if os(macOS)
+        if VPhoneVirtualMachine.isVirtualMachine(url: url) {
+            let config = (try? VPhoneConfiguration.loadMetadata(from: url)) ?? VPhoneConfiguration(name: url.lastPathComponent)
+            loaded = try VPhoneVirtualMachine(packageUrl: url, configuration: config, isShortcut: isShortcut(url))
+        }
+        #endif
+        let config: (any UTMConfiguration)?
+        if loaded == nil {
+            config = try? UTMQemuConfiguration.load(from: url)
+        } else {
+            config = nil
+        }
         #if !WITH_REMOTE
         if let qemuConfig = config as? UTMQemuConfiguration {
             loaded = try UTMQemuVirtualMachine(packageUrl: url, configuration: qemuConfig, isShortcut: isShortcut(url))
@@ -237,6 +251,11 @@ import SwiftUI
                 self?.objectWillChange.send()
             })
         }
+        if let vphoneConfig = wrapped?.config as? VPhoneConfiguration {
+            s.append(vphoneConfig.objectWillChange.sink { [weak self] _ in
+                self?.objectWillChange.send()
+            })
+        }
         #endif
         if let registryEntry = registryEntry {
             s.append(registryEntry.objectWillChange.sink { [weak self] in
@@ -298,6 +317,11 @@ extension VMData {
     func isShortcut(_ url: URL) -> Bool {
         let defaultStorageUrl = UTMData.defaultStorageUrl.standardizedFileURL
         let parentUrl = url.deletingLastPathComponent().standardizedFileURL
+        #if os(macOS)
+        if parentUrl == VPhoneVirtualMachine.libraryRoot.standardizedFileURL {
+            return false
+        }
+        #endif
         return parentUrl != defaultStorageUrl
     }
     
@@ -370,6 +394,9 @@ extension VMData {
         if let appleConfig = config as? UTMAppleConfiguration {
             return appleConfig.system.boot.operatingSystem.rawValue
         }
+        if let _ = config as? VPhoneConfiguration {
+            return "Virtual iPhone"
+        }
         #endif
         return unavailable
     }
@@ -382,6 +409,9 @@ extension VMData {
         #if os(macOS)
         if let appleConfig = config as? UTMAppleConfiguration {
             return appleConfig.system.architecture
+        }
+        if let _ = config as? VPhoneConfiguration {
+            return "Apple Silicon"
         }
         #endif
         return unavailable
@@ -396,6 +426,9 @@ extension VMData {
         #if os(macOS)
         if let appleConfig = config as? UTMAppleConfiguration {
             return ByteCountFormatter.string(fromByteCount: Int64(appleConfig.system.memorySize) * bytesInMib, countStyle: .binary)
+        }
+        if let vphoneConfig = config as? VPhoneConfiguration {
+            return ByteCountFormatter.string(fromByteCount: Int64(vphoneConfig.memorySizeMib) * bytesInMib, countStyle: .binary)
         }
         #endif
         return unavailable

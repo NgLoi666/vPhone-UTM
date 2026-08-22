@@ -37,8 +37,26 @@ struct VMDetailsView: View {
     private var sizeLabel: String {
         return ByteCountFormatter.string(fromByteCount: size, countStyle: .binary)
     }
+
+    private var isVPhone: Bool {
+        #if os(macOS)
+        vm.config is VPhoneConfiguration
+        #else
+        false
+        #endif
+    }
     
     var body: some View {
+        if isVPhone {
+            #if os(macOS)
+            if let vphoneConfig = vm.config as? VPhoneConfiguration {
+                VPhoneDetailsView(vm: vm, config: vphoneConfig)
+                    .environmentObject(data)
+            }
+            #else
+            EmptyView()
+            #endif
+        } else {
         if vm.isDeleted {
             VStack {
                 Spacer()
@@ -125,6 +143,7 @@ struct VMDetailsView: View {
                 }
                 #endif
             }
+        }
         }
     }
 

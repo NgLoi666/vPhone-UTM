@@ -48,6 +48,11 @@ extension UTMData {
                     window = VMHeadlessSessionState(for: qvm, onStop: close)
                 }
             }
+            if let vphoneVM = vm.wrapped as? VPhoneVirtualMachine {
+                // vphone-cli owns the native iPhone display window. UTM keeps the
+                // library session alive and reflects its lifecycle in the sidebar.
+                window = VMHeadlessSessionState(for: vphoneVM, onStop: close)
+            }
             if window == nil {
                 DispatchQueue.main.async {
                     self.alertItem = .message(NSLocalizedString("This virtual machine cannot be run on this machine.", comment: "UTMDataExtension"))

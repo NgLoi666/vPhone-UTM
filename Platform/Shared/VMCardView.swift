@@ -28,6 +28,22 @@ struct VMCardView: View {
     
     var body: some View {
         HStack {
+            #if os(macOS)
+            if vm.config is VPhoneConfiguration {
+                Image(systemName: "iphone")
+                    .resizable()
+                    .frame(width: 18, height: 30)
+                    .foregroundColor(.accentColor)
+            } else if vm.isShortcut {
+                Logo(logo: PlatformImage(contentsOfURL: vm.detailsIconUrl))
+                        .overlay(Image(systemName: "arrowshape.turn.up.forward.fill")
+                                    .resizable()
+                                    .frame(width: 8, height: 8)
+                                    .aspectRatio(contentMode: .fit), alignment: .bottomLeading)
+            } else {
+                Logo(logo: PlatformImage(contentsOfURL: vm.detailsIconUrl))
+            }
+            #else
             if vm.isShortcut {
                 Logo(logo: PlatformImage(contentsOfURL: vm.detailsIconUrl))
                         .overlay(Image(systemName: "arrowshape.turn.up.forward.fill")
@@ -37,6 +53,7 @@ struct VMCardView: View {
             } else {
                 Logo(logo: PlatformImage(contentsOfURL: vm.detailsIconUrl))
             }
+            #endif
             VStack(alignment: .leading) {
                 Text(vm.detailsTitleLabel)
                     .font(.headline)

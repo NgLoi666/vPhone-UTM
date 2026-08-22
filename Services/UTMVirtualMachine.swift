@@ -465,6 +465,784 @@ extension UTMVirtualMachine {
     }
 }
 
+// MARK: - vPhone backend
+
+#if os(macOS)
+/// Live status for the first-install flow shown by the vPhone wizard.
+///
+/// Firmware archives are owned by vphone-cli in `~/.vphone/ipsws`. Its aria2
+/// downloader retains partial files and resumes them on the next run, so the
+/// wizard can safely discard only an incomplete VM bundle when retrying.
+@MainActor
+final class VPhoneProvisioningController: ObservableObject {
+    @Published private(set) var title = "Preparing setup"
+    @Published private(set) var detail = "Starting vphone-cli…"
+    @Published private(set) var progress: Double?
+    @Published private(set) var downloadedSize: String?
+    @Published private(set) var totalSize: String?
+    @Published private(set) var downloadSpeed: String?
+    @Published private(set) var timeRemaining: String?
+    @Published private(set) var isRunning = false
+    @Published private(set) var canRetry = false
+    @Published private(set) var canRestartDownload = false
+    @Published private(set) var didFinish = false
+    @Published private(set) var logs = ""
+
+    var hasLogs: Bool { !logs.isEmpty }
+
+    private(set) var isCancellationRequested = false
+    private(set) var ownsIncompleteBundle = false
+    private var restartDownloadRequested = false
+    private var process: Process?
+    private var downloadMonitor: Timer?
+    private var monitoredDownload: URL?
+    private var lastDownloadSample: (size: Int64, date: Date)?
+    private var attemptedAMFIRecovery = false
+
+    func begin(retrying: Bool) {
+        stopMonitoringDownload()
+        isCancellationRequested = false
+        isRunning = true
+        canRetry = false
+        canRestartDownload = false
+        didFinish = false
+        if !retrying {
+            logs = ""
+            attemptedAMFIRecovery = false
+        }
+        title = retrying ? "Continuing setup" : "Preparing setup"
+        detail = retrying ? "Using the downloaded firmware cache…" : "Starting vphone-cli…"
+        if !retrying {
+            progress = nil
+            downloadedSize = nil
+            totalSize = nil
+            downloadSpeed = nil
+            timeRemaining = nil
+        }
+    }
+
+    func cancel() {
+        guard isRunning else { return }
+        isCancellationRequested = true
+        restartDownloadRequested = false
+        title = "Pausing setup"
+        detail = "Keeping downloaded firmware so it can continue later…"
+        process?.terminate()
+    }
+
+    func restartDownload() {
+        guard isRunning, canRestartDownload, monitoredDownload != nil else { return }
+        isCancellationRequested = true
+        restartDownloadRequested = true
+        canRestartDownload = false
+        title = "Restarting firmware download"
+        detail = "Removing only the incomplete IPSW and downloading it again…"
+        process?.terminate()
+    }
+
+    /// Runs once after macOS terminates vphone-cli for AMFI validation. The
+    /// actual authorization is presented by macOS; the app never receives or
+    /// stores the administrator password.
+    func beginAMFIRecovery() -> Bool {
+        guard !attemptedAMFIRecovery else { return false }
+        attemptedAMFIRecovery = true
+        stopMonitoringDownload()
+        isRunning = true
+        canRetry = false
+        canRestartDownload = false
+        title = "Enabling vphone-cli"
+        detail = "macOS is requesting administrator permission…"
+        appendLog("\n[amfidont] Requesting macOS administrator permission.\n")
+        return true
+    }
+
+    func resetAMFIRecoveryForManualRetry() {
+        attemptedAMFIRecovery = false
+    }
+
+    fileprivate func willCreateBundle() {
+        // This is set only after a new name has been verified as unused. It keeps
+        // a retry from ever removing a pre-existing, user-created VM.
+        ownsIncompleteBundle = true
+    }
+
+    fileprivate func attach(process: Process) {
+        self.process = process
+    }
+
+    fileprivate func detach(process: Process) {
+        guard self.process === process else { return }
+        self.process = nil
+    }
+
+    fileprivate func receive(_ output: String) {
+        appendLog(output)
+        let lines = output
+            .split(whereSeparator: { $0.isNewline })
+            .map(String.init)
+
+        for line in lines where !line.isEmpty {
+            updateStage(for: line)
+        }
+        // aria2 refreshes a single carriage-return line. Parse the complete
+        // chunk too, so a progress update is not lost before its next newline.
+        updateDownloadStats(for: output)
+    }
+
+    @discardableResult
+    func paused() -> Bool {
+        let shouldRestartDownload = restartDownloadRequested
+        restartDownloadRequested = false
+        canRestartDownload = false
+        let partialDownload = monitoredDownload
+        stopMonitoringDownload()
+        isRunning = false
+        if shouldRestartDownload {
+            guard let partialDownload else {
+                title = "Setup paused"
+                detail = "The partial IPSW could not be identified. Continue to resume it."
+                canRetry = true
+                return false
+            }
+            do {
+                if FileManager.default.fileExists(atPath: partialDownload.path) {
+                    try FileManager.default.removeItem(at: partialDownload)
+                }
+                title = "Restarting firmware download"
+                detail = "The partial IPSW was removed. Starting a new download…"
+                progress = nil
+                downloadedSize = nil
+                totalSize = nil
+                downloadSpeed = nil
+                timeRemaining = nil
+                return true
+            } catch {
+                title = "Setup paused"
+                detail = "Could not remove the partial IPSW. Continue will resume it."
+                canRetry = true
+                return false
+            }
+        }
+        canRetry = true
+        title = "Setup paused"
+        detail = "The firmware cache is preserved. Continue to resume the download."
+        downloadSpeed = nil
+        timeRemaining = nil
+        return false
+    }
+
+    func failed(with error: Error) {
+        stopMonitoringDownload()
+        isRunning = false
+        canRetry = ownsIncompleteBundle
+        canRestartDownload = false
+        title = "Setup needs attention"
+        detail = error.localizedDescription
+        appendLog("\n[setup] \(error.localizedDescription)\n")
+        downloadSpeed = nil
+        timeRemaining = nil
+    }
+
+    func finished() {
+        stopMonitoringDownload()
+        isRunning = false
+        canRetry = false
+        canRestartDownload = false
+        didFinish = true
+        title = "Virtual iPhone is ready"
+        detail = "Firmware is installed and the iPhone was added to your library."
+        progress = 1
+        downloadSpeed = nil
+        timeRemaining = nil
+    }
+
+    private func updateStage(for line: String) {
+        switch line {
+        case let line where line.contains("=== fw prepare ==="):
+            title = "Downloading firmware"
+            detail = "Getting the iPhone and CloudOS firmware from Apple…"
+        case let line where line.contains("==> Downloading "):
+            title = "Downloading firmware"
+            detail = line.replacingOccurrences(of: "==> ", with: "")
+            progress = 0
+            downloadedSize = nil
+            totalSize = nil
+            downloadSpeed = nil
+            timeRemaining = nil
+            monitorDownload(named: firmwareFilename(in: line))
+        case let line where line.contains("Found existing") && line.contains("resuming"):
+            title = "Continuing firmware download"
+            detail = "A partially downloaded IPSW was found; resuming it now."
+            canRestartDownload = true
+            monitorDownload(named: firmwareFilename(in: line))
+        case let line where line.contains("==> Extracting") || line.contains("Importing cloudOS") || line.contains("Generating hybrid"):
+            stopMonitoringDownload()
+            title = "Preparing firmware"
+            detail = line.replacingOccurrences(of: "==> ", with: "")
+            progress = nil
+            downloadSpeed = nil
+            timeRemaining = nil
+        case let line where line.contains("=== fw patch ==="):
+            title = "Patching firmware"
+            detail = "Preparing the selected virtual iPhone profile…"
+            progress = nil
+        case let line where line.contains("=== Restore phase ==="):
+            title = "Installing iOS"
+            detail = "Restoring firmware to the virtual iPhone…"
+            progress = nil
+        case let line where line.contains("=== CFW install"):
+            title = "Finishing setup"
+            detail = "macOS may ask for administrator approval."
+            progress = nil
+        case let line where line.contains("host-mode CFW install") || line.contains("files placed on host mounts"):
+            title = "Finishing setup"
+            detail = "Installing custom firmware on the virtual iPhone — this can take several minutes…"
+            progress = nil
+        case let line where line.contains("=== First boot ===") || line.contains("=== Boot analysis ==="):
+            title = "Starting virtual iPhone"
+            detail = "Verifying the first boot…"
+            progress = nil
+        default:
+            break
+        }
+    }
+
+    private func appendLog(_ text: String) {
+        logs.append(text)
+        let maximumLength = 128_000
+        if logs.count > maximumLength {
+            logs = String(logs.suffix(maximumLength))
+        }
+    }
+
+    private func updateDownloadStats(for line: String) {
+        let pattern = #"([0-9]+(?:\.[0-9]+)?\s*[KMGT]?i?B)\s*/\s*([0-9]+(?:\.[0-9]+)?\s*[KMGT]?i?B)\s*\(\s*([0-9]{1,3})%\s*\).*?\bDL:\s*([^\s\]]+)(?:.*?\bETA:\s*([^\s\]]+))?"#
+        guard let expression = try? NSRegularExpression(pattern: pattern),
+              let match = expression.matches(in: line, range: NSRange(line.startIndex..., in: line)).last,
+              match.numberOfRanges == 6,
+              let percentRange = Range(match.range(at: 3), in: line),
+              let percent = Double(line[percentRange])
+        else { return }
+
+        let value = { (index: Int) -> String? in
+            guard let range = Range(match.range(at: index), in: line) else { return nil }
+            return String(line[range])
+        }
+        progress = min(max(percent / 100, 0), 1)
+        downloadedSize = value(1)
+        totalSize = value(2)
+        downloadSpeed = value(4).map { "\($0)/s" }
+        timeRemaining = value(5).map { "\($0) remaining" }
+    }
+
+    private func firmwareFilename(in line: String) -> String? {
+        let prefixes = ["==> Downloading ", "==> Found existing "]
+        let filename = prefixes
+            .first(where: { line.contains($0) })
+            .map { line.replacingOccurrences(of: $0, with: "") }
+            ?? line
+        let candidate = filename
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(separator: " ")
+            .first
+            .map(String.init)
+        guard let candidate, candidate.hasSuffix(".ipsw") else { return nil }
+        return candidate
+    }
+
+    private func monitorDownload(named filename: String?) {
+        stopMonitoringDownload()
+        guard let filename else { return }
+        monitoredDownload = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".vphone/ipsws", isDirectory: true)
+            .appendingPathComponent(filename)
+        sampleDownload()
+        downloadMonitor = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.sampleDownload()
+            }
+        }
+    }
+
+    private func sampleDownload() {
+        guard let monitoredDownload,
+              let attributes = try? FileManager.default.attributesOfItem(atPath: monitoredDownload.path),
+              let fileSize = attributes[.size] as? NSNumber
+        else { return }
+
+        let size = fileSize.int64Value
+        let now = Date()
+        downloadedSize = Self.formattedByteCount(size)
+        if let previous = lastDownloadSample {
+            let elapsed = now.timeIntervalSince(previous.date)
+            let delta = max(0, size - previous.size)
+            if elapsed > 0, delta > 0 {
+                downloadSpeed = "\(Self.formattedByteCount(Int64(Double(delta) / elapsed)))/s"
+            }
+        }
+        lastDownloadSample = (size, now)
+    }
+
+    private func stopMonitoringDownload() {
+        downloadMonitor?.invalidate()
+        downloadMonitor = nil
+        monitoredDownload = nil
+        lastDownloadSample = nil
+    }
+
+    private static func formattedByteCount(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
+}
+
+/// A UTM-compatible adapter for vphone-cli's native Apple Virtualization bundles.
+/// The iPhone display remains owned by vphone-cli; this app owns the UTM-style
+/// library, settings and lifecycle controls.
+@MainActor
+final class VPhoneVirtualMachine: UTMVirtualMachine {
+    struct Capabilities: UTMVirtualMachineCapabilities {
+        let supportsProcessKill = true
+        let supportsSnapshots = false
+        let supportsScreenshots = false
+        let supportsDisposibleMode = false
+        let supportsRecoveryMode = false
+        let supportsRemoteSession = false
+    }
+
+    static let capabilities = Capabilities()
+
+    static var libraryRoot: URL {
+        if let override = ProcessInfo.processInfo.environment["VPHONE_LIBRARY_ROOT"], !override.isEmpty {
+            return URL(fileURLWithPath: override, isDirectory: true)
+        }
+        return URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+            .appendingPathComponent(".vphone/VMs", isDirectory: true)
+    }
+
+    private(set) var pathUrl: URL
+    private(set) var isShortcut = false
+    private(set) var isRunningAsDisposible = false
+    weak var delegate: (any UTMVirtualMachineDelegate)?
+    var onConfigurationChange: (() -> Void)?
+    var onStateChange: (() -> Void)?
+    private(set) var config: VPhoneConfiguration {
+        willSet { onConfigurationChange?() }
+    }
+    private(set) var registryEntry: UTMRegistryEntry {
+        willSet { onConfigurationChange?() }
+    }
+    private(set) var state: UTMVirtualMachineState = .stopped {
+        willSet { onStateChange?() }
+        didSet { delegate?.virtualMachine(self, didTransitionToState: state) }
+    }
+    private(set) var screenshot: UTMVirtualMachineScreenshot?
+    let snapshotUnsupportedError: Error? = UTMVirtualMachineError.notImplemented
+    let isHeadless = false
+
+    private var launchProcess: Process?
+
+    static func isVirtualMachine(url: URL) -> Bool {
+        FileManager.default.fileExists(atPath: url.appendingPathComponent("config.plist").path)
+    }
+
+    static func virtualMachineName(for url: URL) -> String {
+        url.lastPathComponent
+    }
+
+    static func virtualMachinePath(for name: String, in parentUrl: URL) -> URL {
+        let illegal = CharacterSet(charactersIn: "/:\\?%*|\"<>")
+        let safeName = name.components(separatedBy: illegal).joined(separator: "-")
+        return libraryRoot.appendingPathComponent(safeName, isDirectory: true)
+    }
+
+    init(packageUrl: URL, configuration: VPhoneConfiguration, isShortcut: Bool = false) throws {
+        self.pathUrl = packageUrl
+        self.config = configuration
+        self.isShortcut = isShortcut
+        self.registryEntry = UTMRegistryEntry.empty
+        if !FileManager.default.fileExists(atPath: packageUrl.appendingPathComponent(VPhoneConfiguration.metadataFilename).path) {
+            try? configuration.saveMetadata(to: packageUrl)
+        }
+        self.registryEntry = loadRegistry()
+    }
+
+    func reload(from packageUrl: URL?) throws {
+        let newPath = packageUrl ?? pathUrl
+        if let metadata = try? VPhoneConfiguration.loadMetadata(from: newPath) {
+            config = metadata
+        } else {
+            config = VPhoneConfiguration(name: newPath.lastPathComponent)
+            try? config.saveMetadata(to: newPath)
+        }
+        pathUrl = newPath
+        updateConfigFromRegistry()
+    }
+
+    func save() async throws {
+        let oldName = pathUrl.lastPathComponent
+        let newName = config.information.name
+        let fileManager = FileManager.default
+        if config.replaceIncompleteBundleOnSave && fileManager.fileExists(atPath: pathUrl.path) {
+            // The retry button is only enabled for a bundle created by this setup
+            // controller. IPSWs live outside this bundle and are deliberately kept
+            // so aria2 can continue their partial downloads.
+            try fileManager.removeItem(at: pathUrl)
+        }
+        if fileManager.fileExists(atPath: pathUrl.path) {
+            if oldName != newName {
+                try await runCLI(["vm", "rename", oldName, newName])
+                pathUrl = Self.virtualMachinePath(for: newName, in: Self.libraryRoot)
+            }
+            try await runCLI(["vm", "config", newName,
+                              "--cpu", String(config.cpuCount),
+                              "--memory", String(config.memorySizeMib),
+                              "--network", config.networkMode])
+        } else {
+            var command = ["vm", "create", newName,
+                           "-V", config.variant,
+                           "--disk-size", String(config.diskSizeGib),
+                           "--root-popup", "-v"]
+            if let iphoneSource = config.iphoneSource, let cloudOSSource = config.cloudOSSource {
+                command += ["--iphone-source", Self.sourceArgument(for: iphoneSource),
+                            "--cloudos-source", Self.sourceArgument(for: cloudOSSource)]
+            }
+            if config.enableFrida { command += ["--frida"] }
+            if config.forceDSCMaxSlide { command += ["--force-dsc-maxslide"] }
+            if config.keepArtifacts { command += ["--keep-artifacts"] }
+            if config.variant == "exp" {
+                let spoofBuild = config.spoofBuild.trimmingCharacters(in: .whitespaces)
+                if !spoofBuild.isEmpty { command += ["--spoof-build", spoofBuild] }
+            }
+            config.provisioningController?.willCreateBundle()
+            try await runCLI(command, controller: config.provisioningController)
+            try await runCLI(["vm", "config", newName,
+                              "--cpu", String(config.cpuCount),
+                              "--memory", String(config.memorySizeMib),
+                              "--network", config.networkMode])
+        }
+        pathUrl = Self.virtualMachinePath(for: newName, in: Self.libraryRoot)
+        try config.saveMetadata(to: pathUrl)
+        try await updateRegistryFromConfig()
+    }
+
+    func updateRegistryFromConfig() async throws {
+        try await updateRegistryBasics()
+    }
+
+    func updateConfigFromRegistry() {
+        if registryEntry.name != config.information.name {
+            registryEntry.name = config.information.name
+        }
+    }
+
+    func changeUuid(to uuid: UUID, name: String? = nil, copyingEntry entry: UTMRegistryEntry?) {
+        config.information.uuid = uuid
+        if let name { config.information.name = name }
+        registryEntry = UTMRegistry.shared.entry(for: self)
+        if let entry { registryEntry.update(copying: entry) }
+    }
+
+    func start(options: UTMVirtualMachineStartOptions = []) async throws {
+        guard state == .stopped else { return }
+        guard FileManager.default.fileExists(atPath: pathUrl.path) else {
+            throw VPhoneVirtualMachineError.bundleMissing
+        }
+        let process = Process()
+        process.executableURL = try Self.executableURL()
+        process.arguments = Self.arguments(["vm", "launch", config.information.name])
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        state = .starting
+        do {
+            try process.run()
+        } catch {
+            state = .stopped
+            throw error
+        }
+        launchProcess = process
+        state = .started
+        process.terminationHandler = { [weak self] process in
+            Task { @MainActor [weak self] in
+                guard let self, self.launchProcess === process else { return }
+                self.launchProcess = nil
+                self.state = .stopped
+                if process.terminationStatus != 0 {
+                    self.delegate?.virtualMachine(self, didErrorWithMessage: VPhoneVirtualMachineError.commandFailed(process.terminationStatus).localizedDescription)
+                }
+            }
+        }
+    }
+
+    func stop(usingMethod method: UTMVirtualMachineStopMethod = .request) async throws {
+        guard state != .stopped else { return }
+        state = .stopping
+        do {
+            try await runCLI(["vm", "stop", config.information.name])
+        } catch {
+            state = .started
+            throw error
+        }
+        if launchProcess?.isRunning == true {
+            launchProcess?.terminate()
+        }
+        launchProcess = nil
+        state = .stopped
+    }
+
+    func restart() async throws {
+        try await stop(usingMethod: .request)
+        try await start(options: [])
+    }
+
+    func clone(to newName: String) async throws {
+        try await runCLI(["vm", "clone", config.information.name, newName])
+        let destination = Self.virtualMachinePath(for: newName, in: Self.libraryRoot)
+        let copiedData = try PropertyListEncoder().encode(config)
+        let copiedConfig = try PropertyListDecoder().decode(VPhoneConfiguration.self, from: copiedData)
+        copiedConfig.information.name = newName
+        copiedConfig.information.uuid = UUID()
+        try copiedConfig.saveMetadata(to: destination)
+    }
+
+    func deleteFromLibrary() async throws {
+        if state != .stopped {
+            try await stop(usingMethod: .force)
+        }
+        try await runCLI(["vm", "delete", config.information.name, "--force"])
+    }
+
+    func pause() async throws { throw UTMVirtualMachineError.notImplemented }
+    func resume() async throws { throw UTMVirtualMachineError.notImplemented }
+    func takeScreenshot() async -> Bool { false }
+    func reloadScreenshotFromFile() throws { }
+
+    private static func executableURL() throws -> URL {
+        let environment = ProcessInfo.processInfo.environment
+        let candidates = [environment["VPHONE_CLI_PATH"], "/opt/homebrew/bin/vphone-cli", "/usr/local/bin/vphone-cli"]
+            .compactMap { $0 }
+            .map { URL(fileURLWithPath: $0) }
+        guard let executable = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0.path) }) else {
+            throw VPhoneVirtualMachineError.cliNotFound
+        }
+        return executable
+    }
+
+    /// Enables the path-scoped AMFI helper shipped with vphone-cli. `osascript`
+    /// asks macOS to authenticate the user, so no password is ever handled by
+    /// vPhone itself.
+    static func enableAMFIPermission(using controller: VPhoneProvisioningController) async throws {
+        let executable = try executableURL()
+        controller.receive("[amfidont] Starting the bundled permission helper…\n")
+        let output = try await VPhoneAMFIWorkaround.enable(for: executable)
+        if !output.isEmpty {
+            controller.receive("[amfidont] \(output)\n")
+        }
+        controller.receive("[amfidont] Permission helper finished; retrying vphone-cli.\n")
+    }
+
+    private static func arguments(_ command: [String]) -> [String] {
+        command + ["--library-root", libraryRoot.path]
+    }
+
+    private static func sourceArgument(for source: URL) -> String {
+        source.isFileURL ? source.path : source.absoluteString
+    }
+
+    /// Runs `command`, and — unless `allowAMFIRecovery` is false — transparently
+    /// requests the amfidont permission and retries once if macOS's AMFI killed
+    /// vphone-cli (exit 9/137) before it could even start. Without this, any
+    /// command other than `vm create` (delete, stop, rename, clone, config) hit
+    /// a dead-end "macOS stopped vphone-cli…" alert with no recovery path, since
+    /// only the create wizard drove `beginAMFIRecovery`/`enableAMFIPermission`.
+    /// `vm create` opts out (`allowAMFIRecovery: false`) because VMWizardView
+    /// already owns AMFI recovery for that command, tied into its
+    /// pause/retry/`ownsIncompleteBundle` state machine — retrying here too
+    /// would just prompt for the administrator password twice on failure.
+    private func runCLI(
+        _ command: [String], controller: VPhoneProvisioningController? = nil, allowAMFIRecovery: Bool = true
+    ) async throws {
+        let executable = try Self.executableURL()
+        let arguments = Self.arguments(command)
+        let status = try await Self.spawnCLI(executable: executable, arguments: arguments, controller: controller)
+        if status == 0 { return }
+
+        let error = VPhoneVirtualMachineError.commandFailed(status)
+        guard allowAMFIRecovery, error.needsAMFIPermission else { throw error }
+
+        await controller?.receive("\n[amfidont] macOS blocked vphone-cli; requesting administrator permission…\n")
+        let output = try await VPhoneAMFIWorkaround.enable(for: executable)
+        if !output.isEmpty { await controller?.receive("[amfidont] \(output)\n") }
+
+        let retryStatus = try await Self.spawnCLI(executable: executable, arguments: arguments, controller: controller)
+        guard retryStatus == 0 else { throw VPhoneVirtualMachineError.commandFailed(retryStatus) }
+    }
+
+    private static func spawnCLI(
+        executable: URL, arguments: [String], controller: VPhoneProvisioningController?
+    ) async throws -> Int32 {
+        try await withCheckedThrowingContinuation { continuation in
+            let process = Process()
+            process.executableURL = executable
+            process.arguments = arguments
+            let output = Pipe()
+            let errors = Pipe()
+            let readOutput: (FileHandle) -> Void = { handle in
+                let data = handle.availableData
+                guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+                Task { @MainActor in controller?.receive(text) }
+            }
+            output.fileHandleForReading.readabilityHandler = readOutput
+            errors.fileHandleForReading.readabilityHandler = readOutput
+            process.standardOutput = output
+            process.standardError = errors
+            process.terminationHandler = { finishedProcess in
+                output.fileHandleForReading.readabilityHandler = nil
+                errors.fileHandleForReading.readabilityHandler = nil
+                Task { @MainActor in controller?.detach(process: finishedProcess) }
+                continuation.resume(returning: finishedProcess.terminationStatus)
+            }
+            do {
+                try process.run()
+                controller?.attach(process: process)
+            } catch {
+                output.fileHandleForReading.readabilityHandler = nil
+                errors.fileHandleForReading.readabilityHandler = nil
+                continuation.resume(throwing: error)
+            }
+        }
+    }
+}
+
+/// Invokes vphone-cli's own `vphone-amfidont` helper through the standard
+/// macOS authorization dialog. The helper allowlists only its enclosing
+/// vphone-cli.app bundle rather than enabling a global bypass.
+private enum VPhoneAMFIWorkaround {
+    static func enable(for cliExecutable: URL) async throws -> String {
+        let resolvedExecutable = cliExecutable.resolvingSymlinksInPath()
+        let app = resolvedExecutable
+            .deletingLastPathComponent() // MacOS
+            .deletingLastPathComponent() // Contents
+            .deletingLastPathComponent() // vphone-cli.app
+        let helper = app
+            .appendingPathComponent("Contents/Resources/vphone-amfidont")
+        guard FileManager.default.isExecutableFile(atPath: helper.path) else {
+            throw VPhoneAMFIWorkaroundError.helperMissing
+        }
+
+        guard let amfidont = amfidontURL() else {
+            throw VPhoneAMFIWorkaroundError.amfidontMissing
+        }
+
+        // The bundled helper uses `command -v amfidont`; GUI applications do
+        // not inherit the user's shell PATH, so provide the discovered path.
+        let searchPath = [
+            amfidont.deletingLastPathComponent().path,
+            "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"
+        ].joined(separator: ":")
+        let command = "PATH=\(shellQuote(searchPath)) \(shellQuote(helper.path))"
+        let appleScript = "do shell script \(appleScriptString(command)) with administrator privileges"
+        return try await runAppleScript(appleScript)
+    }
+
+    private static func amfidontURL() -> URL? {
+        let fileManager = FileManager.default
+        let home = fileManager.homeDirectoryForCurrentUser
+        let userPythonDirectory = home.appendingPathComponent("Library/Python", isDirectory: true)
+        let pythonBins = (try? fileManager.contentsOfDirectory(at: userPythonDirectory,
+                                                                includingPropertiesForKeys: [.isDirectoryKey],
+                                                                options: [.skipsHiddenFiles])) ?? []
+        let candidates = pythonBins.map { $0.appendingPathComponent("bin/amfidont") }
+            + [URL(fileURLWithPath: "/opt/homebrew/bin/amfidont"),
+               URL(fileURLWithPath: "/usr/local/bin/amfidont")]
+        return candidates.first(where: { fileManager.isExecutableFile(atPath: $0.path) })
+    }
+
+    private static func runAppleScript(_ script: String) async throws -> String {
+        try await withCheckedThrowingContinuation { continuation in
+            let process = Process()
+            let output = Pipe()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            process.arguments = ["-e", script]
+            process.standardOutput = output
+            process.standardError = output
+            process.terminationHandler = { finishedProcess in
+                let data = output.fileHandleForReading.readDataToEndOfFile()
+                let text = String(data: data, encoding: .utf8) ?? ""
+                if finishedProcess.terminationStatus == 0 {
+                    continuation.resume(returning: text.trimmingCharacters(in: .whitespacesAndNewlines))
+                } else {
+                    continuation.resume(throwing: VPhoneAMFIWorkaroundError.authorizationFailed(text))
+                }
+            }
+            do {
+                try process.run()
+            } catch {
+                continuation.resume(throwing: error)
+            }
+        }
+    }
+
+    private static func shellQuote(_ value: String) -> String {
+        "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
+    }
+
+    private static func appleScriptString(_ value: String) -> String {
+        let escaped = value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: "\\n")
+        return "\"\(escaped)\""
+    }
+}
+
+private enum VPhoneAMFIWorkaroundError: LocalizedError {
+    case helperMissing
+    case amfidontMissing
+    case authorizationFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .helperMissing:
+            return "The vphone-amfidont helper is missing from vphone-cli. Reinstall vphone-cli and try again."
+        case .amfidontMissing:
+            return "amfidont is not installed. Install it with ‘xcrun python3 -m pip install -U amfidont’, then try again."
+        case .authorizationFailed(let output):
+            if output.localizedCaseInsensitiveContains("User canceled") || output.contains("-128") {
+                return "Administrator permission was not granted."
+            }
+            return output.isEmpty ? "macOS could not enable vphone-cli." : output
+        }
+    }
+}
+
+enum VPhoneVirtualMachineError: LocalizedError {
+    case cliNotFound
+    case bundleMissing
+    case commandFailed(Int32)
+
+    var needsAMFIPermission: Bool {
+        if case let .commandFailed(status) = self {
+            return status == 9 || status == 137
+        }
+        return false
+    }
+
+    var errorDescription: String? {
+        switch self {
+        case .cliNotFound:
+            return NSLocalizedString("vphone-cli was not found. Install it with Homebrew, then reopen vPhone.", comment: "VPhoneVirtualMachine")
+        case .bundleMissing:
+            return NSLocalizedString("The virtual iPhone bundle could not be found.", comment: "VPhoneVirtualMachine")
+        case .commandFailed(let status):
+            if status == 9 || status == 137 {
+                return NSLocalizedString("macOS stopped vphone-cli before setup began, even after vPhone requested permission. Open Show Logs, then choose Continue to try again.", comment: "VPhoneVirtualMachine")
+            }
+            return String.localizedStringWithFormat(NSLocalizedString("vphone-cli exited with code %d.", comment: "VPhoneVirtualMachine"), status)
+        }
+    }
+}
+#endif
+
 // MARK: - Errors
 
 enum UTMVirtualMachineError: Error {
