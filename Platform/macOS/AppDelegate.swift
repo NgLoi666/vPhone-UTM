@@ -172,6 +172,9 @@
         if isDockIconHidden {
             NSApp.setActivationPolicy(.accessory)
         }
+        Task.detached(priority: .utility) {
+            await VPhoneVirtualMachine.ensureAMFIPermissionAtLaunch()
+        }
     }
     
     func application(_ sender: NSApplication, delegateHandlesKey key: String) -> Bool {

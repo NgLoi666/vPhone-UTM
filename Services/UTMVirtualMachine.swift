@@ -1040,6 +1040,23 @@ final class VPhoneVirtualMachine: UTMVirtualMachine {
         controller.receive("[amfidont] Permission helper finished; retrying vphone-cli.\n")
     }
 
+    /// Proactively ensures vphone-cli is allowlisted through AMFI as soon as
+    /// vPhone launches, instead of only reacting after some CLI invocation
+    /// gets killed (exit 9/137) mid-task. `vphone-amfidont` itself checks
+    /// whether amfidont is already running and already covers this app's
+    /// path, and exits immediately with no prompt if so — so this is a no-op
+    /// on every launch except the first one after a host reboot (amfidont's
+    /// daemon doesn't survive that without its own supervision).
+    static func ensureAMFIPermissionAtLaunch() async {
+        guard let executable = try? executableURL() else { return }
+        do {
+            let output = try await VPhoneAMFIWorkaround.enable(for: executable)
+            if !output.isEmpty { NSLog("[amfidont] %@", output) }
+        } catch {
+            NSLog("[amfidont] Launch-time check failed: %@", error.localizedDescription)
+        }
+    }
+
     private static func arguments(_ command: [String]) -> [String] {
         command + ["--library-root", libraryRoot.path]
     }
