@@ -249,6 +249,12 @@ final class VPhoneConfiguration: UTMConfiguration {
     @Published var spoofBuild: String
     @Published var keepArtifacts: Bool
 
+    /// Whether guest haptic feedback (from the optional haptic-forwarder
+    /// tweak, `jb`/`exp` variants only) should buzz the host trackpad's
+    /// Taptic Engine. Passed to `vphone-cli vm launch` as `--no-haptics`
+    /// when off — a launch-time flag, not something baked into the guest.
+    @Published var enableHapticFeedback: Bool
+
     /// Free-form user-defined notes, distinct from `information.notes` — an
     /// ordered list so the user can add/remove/rename entries themselves.
     @Published var customFields: [VPhoneCustomField]
@@ -279,6 +285,7 @@ final class VPhoneConfiguration: UTMConfiguration {
         self.forceDSCMaxSlide = false
         self.spoofBuild = ""
         self.keepArtifacts = false
+        self.enableHapticFeedback = true
         self.customFields = []
     }
 
@@ -297,6 +304,7 @@ final class VPhoneConfiguration: UTMConfiguration {
         case forceDSCMaxSlide = "ForceDSCMaxSlide"
         case spoofBuild = "SpoofBuild"
         case keepArtifacts = "KeepArtifacts"
+        case enableHapticFeedback = "EnableHapticFeedback"
         case customFields = "CustomFields"
     }
 
@@ -315,6 +323,7 @@ final class VPhoneConfiguration: UTMConfiguration {
         forceDSCMaxSlide = try values.decodeIfPresent(Bool.self, forKey: .forceDSCMaxSlide) ?? false
         spoofBuild = try values.decodeIfPresent(String.self, forKey: .spoofBuild) ?? ""
         keepArtifacts = try values.decodeIfPresent(Bool.self, forKey: .keepArtifacts) ?? false
+        enableHapticFeedback = try values.decodeIfPresent(Bool.self, forKey: .enableHapticFeedback) ?? true
         customFields = try values.decodeIfPresent([VPhoneCustomField].self, forKey: .customFields) ?? []
     }
 
@@ -334,6 +343,7 @@ final class VPhoneConfiguration: UTMConfiguration {
         try values.encode(forceDSCMaxSlide, forKey: .forceDSCMaxSlide)
         try values.encode(spoofBuild, forKey: .spoofBuild)
         try values.encode(keepArtifacts, forKey: .keepArtifacts)
+        try values.encode(enableHapticFeedback, forKey: .enableHapticFeedback)
         try values.encode(customFields, forKey: .customFields)
     }
 

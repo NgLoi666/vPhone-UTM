@@ -137,6 +137,14 @@ struct VMContextMenuModifier: ViewModifier {
                 }.disabled(!vm.isModifyAllowed)
                 .help("Move this VM from internal storage to elsewhere.")
             }
+            if vm.config is VPhoneConfiguration {
+                Button {
+                    moveVPhoneDisk(vm: vm)
+                } label: {
+                    Label("Move Disk to External Drive…", systemImage: "externaldrive")
+                }.disabled(!vm.isModifyAllowed || !vm.isStopped)
+                .help("Move just the disk image elsewhere (e.g. an external drive) to free up internal storage — the VM's settings stay where they are.")
+            }
             #endif
             Button {
                 confirmAction = .confirmCloneVM(vm: vm)
@@ -176,4 +184,23 @@ struct VMContextMenuModifier: ViewModifier {
             }
         })
     }
+
+    #if os(macOS)
+    /// `NSOpenPanel` rather than a SwiftUI `.fileImporter` — this is a native,
+    /// self-contained modal, no dependency on the VM library window's own
+    /// SwiftUI hierarchy to host a picker correctly.
+    private func moveVPhoneDisk(vm: VMData) {
+        guard let name = (vm.config as? VPhoneConfiguration)?.information.name else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.message = "Choose a destination for \"\(name)\"'s disk image."
+        panel.prompt = "Move Disk"
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        data.busyWorkAsync {
+            try await VPhoneVirtualMachine.relocateDisk(name: name, to: destination)
+        }
+    }
+    #endif
 }

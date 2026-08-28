@@ -947,11 +947,25 @@ final class VPhoneVirtualMachine: UTMVirtualMachine {
         guard FileManager.default.fileExists(atPath: pathUrl.path) else {
             throw VPhoneVirtualMachineError.bundleMissing
         }
+        var launchCommand = ["vm", "launch", config.information.name]
+        if !config.enableHapticFeedback { launchCommand.append("--no-haptics") }
         let process = Process()
         process.executableURL = try Self.executableURL()
-        process.arguments = Self.arguments(["vm", "launch", config.information.name])
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
+        process.arguments = Self.arguments(launchCommand)
+        // Captured (not discarded) so a "Disk image not found" failure — the
+        // disk got moved via `vm relocate-disk`, e.g. onto external storage,
+        // and its drive isn't mounted or the file moved again since — can be
+        // told apart from any other launch failure and offer a real fix
+        // instead of just a dead-end error message.
+        let outputPipe = Pipe()
+        var capturedOutput = Data()
+        outputPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            capturedOutput.append(data)
+        }
+        process.standardOutput = outputPipe
+        process.standardError = outputPipe
         state = .starting
         do {
             try process.run()
@@ -962,15 +976,79 @@ final class VPhoneVirtualMachine: UTMVirtualMachine {
         launchProcess = process
         state = .started
         process.terminationHandler = { [weak self] process in
+            outputPipe.fileHandleForReading.readabilityHandler = nil
             Task { @MainActor [weak self] in
                 guard let self, self.launchProcess === process else { return }
                 self.launchProcess = nil
                 self.state = .stopped
-                if process.terminationStatus != 0 {
+                guard process.terminationStatus != 0 else { return }
+                let output = String(data: capturedOutput, encoding: .utf8) ?? ""
+                if let missingDiskPath = Self.diskNotFoundPath(in: output) {
+                    self.offerDiskRelocationRecovery(missingDiskPath: missingDiskPath, options: options)
+                } else {
                     self.delegate?.virtualMachine(self, didErrorWithMessage: VPhoneVirtualMachineError.commandFailed(process.terminationStatus).localizedDescription)
                 }
             }
         }
+    }
+
+    /// vphone-cli prints exactly `Disk image not found: <path>` (see
+    /// `VPhoneError.diskNotFound` in vphone-cli-modded) when `vm launch`'s own
+    /// pre-flight file-existence check fails.
+    private static func diskNotFoundPath(in output: String) -> String? {
+        let marker = "Disk image not found: "
+        guard let range = output.range(of: marker) else { return nil }
+        let rest = output[range.upperBound...]
+        return rest.prefix(while: { $0 != "\n" }).trimmingCharacters(in: .whitespaces)
+    }
+
+    /// Offers to repair a stale disk reference (drive unplugged, file moved
+    /// by hand after `vm relocate-disk`) with a native alert rather than just
+    /// reporting the launch failure — "Try Again" re-attempts the same path
+    /// (covers "I just remounted the drive"), "Locate…" lets the user point
+    /// at the disk's current location and repairs the manifest before retrying.
+    @MainActor
+    private func offerDiskRelocationRecovery(missingDiskPath: String, options: UTMVirtualMachineStartOptions) {
+        let alert = NSAlert()
+        alert.messageText = "Couldn't Find the Virtual iPhone's Disk"
+        alert.informativeText = "Expected it at:\n\(missingDiskPath)\n\nIf its drive isn't connected, connect it and try again. If the file was moved, locate its new location."
+        alert.addButton(withTitle: "Locate…")
+        alert.addButton(withTitle: "Try Again")
+        alert.addButton(withTitle: "Cancel")
+        let response = alert.runModal()
+        switch response {
+        case .alertFirstButtonReturn: // Locate…
+            let panel = NSOpenPanel()
+            panel.canChooseFiles = true
+            panel.canChooseDirectories = true
+            panel.allowsMultipleSelection = false
+            panel.message = "Select the disk image (or the folder it's in) at its new location."
+            guard panel.runModal() == .OK, let picked = panel.url else { return }
+            Task { @MainActor in
+                do {
+                    try await Self.relocateDisk(name: config.information.name, to: picked)
+                    try await start(options: options)
+                } catch {
+                    delegate?.virtualMachine(self, didErrorWithMessage: error.localizedDescription)
+                }
+            }
+        case .alertSecondButtonReturn: // Try Again
+            Task { @MainActor in
+                do {
+                    try await start(options: options)
+                } catch {
+                    delegate?.virtualMachine(self, didErrorWithMessage: error.localizedDescription)
+                }
+            }
+        default: // Cancel
+            break
+        }
+    }
+
+    static func relocateDisk(name: String, to destination: URL) async throws {
+        let executable = try executableURL()
+        let args = arguments(["vm", "relocate-disk", name, "--to", destination.path])
+        _ = try await runCapturing(executable: executable, arguments: args)
     }
 
     func stop(usingMethod method: UTMVirtualMachineStopMethod = .request) async throws {
@@ -1038,6 +1116,59 @@ final class VPhoneVirtualMachine: UTMVirtualMachine {
             controller.receive("[amfidont] \(output)\n")
         }
         controller.receive("[amfidont] Permission helper finished; retrying vphone-cli.\n")
+    }
+
+    /// Read-only snapshot of `vphone-cli vm info <name> --json` — versions and
+    /// identity recorded at restore time, so they're readable without booting.
+    struct FirmwareInfo: Decodable {
+        struct OSVersion: Decodable { let version: String; let build: String }
+        struct RestoreInfo: Decodable {
+            let ios: OSVersion
+            let cloudOS: OSVersion
+            let variant: String?
+            let device: String?
+        }
+        let restoreInfo: RestoreInfo?
+        let udid: String?
+    }
+
+    static func firmwareInfo(name: String) async throws -> FirmwareInfo {
+        let executable = try executableURL()
+        let output = try await runCapturing(executable: executable, arguments: arguments(["vm", "info", name, "--json"]))
+        return try JSONDecoder().decode(FirmwareInfo.self, from: Data(output.utf8))
+    }
+
+    private static func runCapturing(executable: URL, arguments: [String]) async throws -> String {
+        try await withCheckedThrowingContinuation { continuation in
+            let process = Process()
+            process.executableURL = executable
+            process.arguments = arguments
+            let output = Pipe()
+            let errors = Pipe()
+            process.standardOutput = output
+            process.standardError = errors
+            process.terminationHandler = { finishedProcess in
+                let data = output.fileHandleForReading.readDataToEndOfFile()
+                let text = String(data: data, encoding: .utf8) ?? ""
+                if finishedProcess.terminationStatus == 0 {
+                    continuation.resume(returning: text)
+                } else {
+                    let errorData = errors.fileHandleForReading.readDataToEndOfFile()
+                    let errorText = String(data: errorData, encoding: .utf8)?
+                        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    if !errorText.isEmpty {
+                        continuation.resume(throwing: VPhoneVirtualMachineError.commandFailedWithMessage(errorText))
+                    } else {
+                        continuation.resume(throwing: VPhoneVirtualMachineError.commandFailed(finishedProcess.terminationStatus))
+                    }
+                }
+            }
+            do {
+                try process.run()
+            } catch {
+                continuation.resume(throwing: error)
+            }
+        }
     }
 
     /// Proactively ensures vphone-cli is allowlisted through AMFI as soon as
@@ -1236,6 +1367,10 @@ enum VPhoneVirtualMachineError: LocalizedError {
     case cliNotFound
     case bundleMissing
     case commandFailed(Int32)
+    /// Like `commandFailed`, but vphone-cli printed something to stderr —
+    /// surface that instead of just the exit code (e.g. `vm relocate-disk`'s
+    /// own validation messages).
+    case commandFailedWithMessage(String)
 
     var needsAMFIPermission: Bool {
         if case let .commandFailed(status) = self {
@@ -1255,6 +1390,8 @@ enum VPhoneVirtualMachineError: LocalizedError {
                 return NSLocalizedString("macOS stopped vphone-cli before setup began, even after vPhone requested permission. Open Show Logs, then choose Continue to try again.", comment: "VPhoneVirtualMachine")
             }
             return String.localizedStringWithFormat(NSLocalizedString("vphone-cli exited with code %d.", comment: "VPhoneVirtualMachine"), status)
+        case .commandFailedWithMessage(let message):
+            return message
         }
     }
 }
