@@ -30,13 +30,8 @@ instead of the bare CLI.
 
 ## Known issues
 
-This is a personal project, fixed as things come up rather than on any schedule:
-
-- The Hardware settings page (and some others) can render blank in the settings sheet on some macOS
-  versions — a `NavigationView`/`NavigationSplitView` layout bug that's still being tracked down.
-  Reopening the sheet or reselecting the page sometimes clears it.
-
-Open an issue if you hit something else — if people find this useful, bugs get fixed.
+This is a personal project, fixed as things come up rather than on any schedule — open an issue if
+you find something and I'll fix it.
 
 ## Install
 
