@@ -1,81 +1,76 @@
 # vPhone-UTM
 
 A personal fork of [UTM](https://github.com/utmapp/UTM) rebuilt into a dedicated macOS frontend for
-[vphone-cli](https://github.com/MakrSas/vphone-cli-modded) — booting a virtual iPhone via Apple's
-Virtualization.framework instead of the general-purpose QEMU/UTM VM manager this project started as.
+[vphone-cli-modded](https://github.com/MakrSas/vphone-cli-modded) — boots a virtual iPhone on Apple
+Silicon via Apple's Virtualization.framework, instead of the general-purpose QEMU/multi-OS VM manager
+this project started as. All credit for the underlying app (UI framework, VM lifecycle plumbing,
+settings-sheet patterns) goes to the upstream UTM project; this fork narrows it to one job.
 
-## What's different from upstream UTM
-
-- **The VM-creation wizard drives `vphone-cli` end-to-end** instead of the generic multi-OS wizard —
-  `Platform/macOS/VMWizardView.swift` was rewritten from the OS-picker/hardware/drives/sharing flow
-  into a 4-step flow (identity → resources → firmware → provisioning) that shells out to
-  `vphone-cli vm create` and streams its progress live in the window.
-- **A dedicated "Virtual iPhone" settings sheet** (`Platform/macOS/VMSettingsView.swift`) — sidebar +
-  detail layout with General/Hardware/Network/SSH/Advanced/Notes pages, freely add/remove custom
-  key-value fields directly in the sidebar, and RAM editing on already-created VMs.
-- **Fix: `vm create` launched via `do shell script … with administrator privileges` (as the GUI
-  must, to grant the private virtualization entitlements) used to hang forever on "trying to
-  authorize"** — the underlying CLI streamed its progress by checking `isatty(STDOUT_FILENO)`, which
-  is always false when driven from a GUI through a pipe. Fixed on the CLI side
-  ([vphone-cli-modded](https://github.com/MakrSas/vphone-cli-modded)); this repo's `UTMVirtualMachine`
-  also gained AMFI self-heal (auto-retries once via `amfidont` if the CLI gets killed by AMFI on an
-  ad-hoc-signed private-entitlement binary).
-- **New app icon.**
-
-## About UTM
-
-> It is possible to invent a single machine which can be used to compute any computable sequence.
-
--- <cite>Alan Turing, 1936</cite>
-
-UTM is a full featured system emulator and virtual machine host for iOS and macOS. It is based off of QEMU. In short, it allows you to run Windows, Linux, and more on your Mac, iPhone, and iPad. More information at https://getutm.app/ and https://mac.getutm.app/
-
-<p align="center">
-  <img width="450px" alt="UTM running on an iPhone" src="screen.png">
-  <br>
-  <img width="450px" alt="UTM running on a MacBook" src="screenmac.png">
-</p>
+vphone-cli-modded does the actual work (firmware download/patch/restore, booting the VM); this app
+is a GUI wrapper around it — creating/managing virtual iPhones from a proper app window and menu bar
+instead of the bare CLI.
 
 ## Features
 
-* Full system emulation (MMU, devices, etc) using QEMU
-* 30+ processors supported including x86_64, ARM64, and RISC-V
-* VGA graphics mode using SPICE and QXL
-* Text terminal mode
-* USB devices
-* JIT based acceleration using QEMU TCG
-* Frontend designed from scratch for macOS 11 and iOS 11+ using the latest and greatest APIs
-* Create, manage, run VMs directly from your device
+- **Guided VM creation** — a 4-step wizard (identity → resources → firmware → provisioning) drives
+  `vphone-cli vm create` end-to-end and streams its progress live in the window, instead of a bare
+  terminal.
+- **Trackpad gestures in the VM window** — scroll gestures on the host trackpad translate into
+  synthetic touch-drag events inside the guest.
+- **Guest haptic feedback on the host trackpad** — when the guest triggers haptic feedback (jailbreak/
+  experimental firmware only), it buzzes the Mac's own trackpad Taptic Engine.
+- **A dedicated "Virtual iPhone" settings sheet** — hardware, network, SSH connection info, and
+  freely-added custom key-value fields, alongside RAM editing on already-created VMs.
+- **Move a VM's disk to external storage** to free up internal space, without losing track of it —
+  the app notices if it's missing at launch and offers to relocate/re-point it.
+- **Self-heals AMFI blocks** — this app (and vphone-cli-modded) run ad-hoc-signed with private
+  virtualization entitlements, which AMFI kills on sight without an allowlist; both apps request that
+  allowlist automatically (a single admin-password prompt) instead of leaving you to run a helper
+  script by hand.
 
-## Additional macOS Features
+## Known issues
 
-* Hardware accelerated virtualization using Hypervisor.framework and QEMU
-* Boot macOS guests with Virtualization.framework on macOS 12+
+This is a personal project, fixed as things come up rather than on any schedule:
 
-## UTM SE
+- The Hardware settings page (and some others) can render blank in the settings sheet on some macOS
+  versions — a `NavigationView`/`NavigationSplitView` layout bug that's still being tracked down.
+  Reopening the sheet or reselecting the page sometimes clears it.
 
-UTM/QEMU requires dynamic code generation (JIT) for maximum performance. JIT on iOS devices require either a jailbroken device, or one of the various workarounds found for specific versions of iOS (see "Install" for more details).
-
-UTM SE ("slow edition") uses a [threaded interpreter][3] which performs better than a traditional interpreter but still slower than JIT. This technique is similar to what [iSH][4] does for dynamic execution. As a result, UTM SE does not require jailbreaking or any JIT workarounds and can be sideloaded as a regular app.
-
-To optimize for size and build times, only the following architectures are included in UTM SE: ARM, PPC, RISC-V, and x86 (all with both 32-bit and 64-bit variants).
+Open an issue if you hit something else — if people find this useful, bugs get fixed.
 
 ## Install
 
-UTM (SE) for iOS: https://getutm.app/install/
+**Prebuilt:** grab the latest build from [Releases](https://github.com/MakrSas/vPhone-UTM/releases) —
+you'll also need [vphone-cli-modded](https://github.com/MakrSas/vphone-cli-modded/releases) installed
+(this app shells out to it). After unzipping to `/Applications`, macOS will quarantine both as
+downloaded — see the AMFI/Gatekeeper notes in each release's description.
 
-UTM is also available for macOS: https://mac.getutm.app/
+**From source:**
 
-## Development
+```bash
+git clone https://github.com/MakrSas/vPhone-UTM.git
+cd vPhone-UTM
+```
 
-### [macOS Development](Documentation/MacDevelopment.md)
+UTM's own dependencies (QEMU, SPICE, …) need to be staged into `sysroot-*` directories first — grab
+them from [utmapp/UTM](https://github.com/utmapp/UTM)'s GitHub Actions `Sysroot-*` build artifacts
+(this fork doesn't touch QEMU/SPICE, so upstream's sysroots are compatible). Then:
 
-### [iOS Development](Documentation/iOSDevelopment.md)
+```bash
+./scripts/install_local.sh
+```
 
-## Related
+This builds the `macOS` scheme (Debug), signs it bottom-up (frameworks/XPC ad-hoc + hardened runtime,
+outer app with `Platform/macOS/local-launch.entitlements`), and installs it to `/Applications`. See
+that script for the manual steps if you'd rather run them yourself, and
+`Documentation/MacDevelopment.md` for the general UTM dev setup this inherits.
 
-* [iSH][4]: emulates a usermode Linux terminal interface for running x86 Linux applications on iOS
-* [a-shell][5]: packages common Unix commands and utilities built natively for iOS and accessible through a terminal interface
+## Requirements
+
+- Apple Silicon Mac, macOS 15+
+- [vphone-cli-modded](https://github.com/MakrSas/vphone-cli-modded) installed at
+  `/opt/homebrew/bin/vphone-cli` (or set `$VPHONE_CLI_PATH`) — see that repo for its own requirements
+  (SIP/AMFI relaxation, etc.), which this app inherits since it just drives that CLI
 
 ## License
 
@@ -89,13 +84,3 @@ Additionally, UTM frontend depends on the following MIT/BSD License components:
 * [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm)
 * [ZIP Foundation](https://github.com/weichsel/ZIPFoundation)
 * [InAppSettingsKit](https://github.com/futuretap/InAppSettingsKit)
-
-Continuous integration hosting is provided by [MacStadium](https://www.macstadium.com/opensource)
-
-[<img src="https://uploads-ssl.webflow.com/5ac3c046c82724970fc60918/5c019d917bba312af7553b49_MacStadium-developerlogo.png" alt="MacStadium logo" width="250">](https://www.macstadium.com)
-
-  [1]: https://github.com/utmapp/UTM/actions?query=event%3Arelease+workflow%3ABuild
-  [2]: screen.png
-  [3]: https://github.com/ktemkin/qemu/blob/with_tcti/tcg/aarch64-tcti/README.md
-  [4]: https://github.com/ish-app/ish
-  [5]: https://github.com/holzschu/a-shell
