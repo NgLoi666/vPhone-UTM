@@ -1,16 +1,6 @@
 name: Make IPA
 on:
   workflow_dispatch:
-    inputs:
-      scheme:
-        description: 'Target scheme'
-        required: true
-        default: 'iOS'
-        type: choice
-        options:
-          - iOS
-          - iOS-SE
-          - iOS-Remote
 
 env:
   BUILD_XCODE_PATH: /Applications/Xcode_26.0.app
@@ -20,18 +10,7 @@ jobs:
   build-sysroot:
     name: Build Sysroot
     runs-on: ${{ env.RUNNER_IMAGE }}
-    outputs:
-      platform: ${{ steps.platform.outputs.value }}
     steps:
-      - name: Determine platform
-        id: platform
-        run: |
-          case "${{ github.event.inputs.scheme }}" in
-            iOS)        echo "value=ios" >> "$GITHUB_OUTPUT" ;;
-            iOS-SE)     echo "value=ios-tci" >> "$GITHUB_OUTPUT" ;;
-            iOS-Remote) echo "value=ios-tci" >> "$GITHUB_OUTPUT" ;;
-          esac
-
       - name: Checkout
         uses: actions/checkout@v3
         with:
@@ -46,9 +25,9 @@ jobs:
         id: cache-sysroot
         uses: actions/cache/restore@v4
         with:
-          path: ./sysroot-${{ steps.platform.outputs.value }}-arm64
-          key: ${{ steps.platform.outputs.value }}-arm64-${{ hashFiles('scripts/build_dependencies.sh') }}-${{ hashFiles('patches/**') }}-${{ github.sha }}
-          restore-keys: ${{ steps.platform.outputs.value }}-arm64-${{ hashFiles('scripts/build_dependencies.sh') }}-${{ hashFiles('patches/**') }}
+          path: ./sysroot-ios-arm64
+          key: ios-arm64-${{ hashFiles('scripts/build_dependencies.sh') }}-${{ hashFiles('patches/**') }}-${{ github.sha }}
+          restore-keys: ios-arm64-${{ hashFiles('scripts/build_dependencies.sh') }}-${{ hashFiles('patches/**') }}
 
       - name: Setup Path
         if: steps.cache-sysroot.outputs.cache-matched-key == ''
@@ -67,16 +46,14 @@ jobs:
 
       - name: Build Sysroot
         if: steps.cache-sysroot.outputs.cache-matched-key == ''
-        run: ./scripts/build_dependencies.sh -p ${{ steps.platform.outputs.value }} -a arm64
-        env:
-          NCPU: ${{ steps.platform.outputs.value == 'ios-tci' && '1' || '0' }}
+        run: ./scripts/build_dependencies.sh -p ios -a arm64
 
       - name: Save Cache
         if: steps.cache-sysroot.outputs.cache-matched-key == ''
         uses: actions/cache/save@v4
         with:
-          path: ./sysroot-${{ steps.platform.outputs.value }}-arm64
-          key: ${{ steps.platform.outputs.value }}-arm64-${{ hashFiles('scripts/build_dependencies.sh') }}-${{ hashFiles('patches/**') }}-${{ github.sha }}
+          path: ./sysroot-ios-arm64
+          key: ios-arm64-${{ hashFiles('scripts/build_dependencies.sh') }}-${{ hashFiles('patches/**') }}-${{ github.sha }}
           upload-chunk-size: 1048576
 
   build-utm:
@@ -97,15 +74,15 @@ jobs:
       - name: Restore Sysroot Cache
         uses: actions/cache/restore@v4
         with:
-          path: ./sysroot-${{ needs.build-sysroot.outputs.platform }}-arm64
-          key: ${{ needs.build-sysroot.outputs.platform }}-arm64-${{ hashFiles('scripts/build_dependencies.sh') }}-${{ hashFiles('patches/**') }}-${{ github.sha }}
+          path: ./sysroot-ios-arm64
+          key: ios-arm64-${{ hashFiles('scripts/build_dependencies.sh') }}-${{ hashFiles('patches/**') }}-${{ github.sha }}
           fail-on-cache-miss: true
 
       - name: Build
         run: |
           ./scripts/build_utm.sh \
             -k iphoneos \
-            -s ${{ github.event.inputs.scheme }} \
+            -s iOS \
             -a arm64 \
             -o UTM
 
@@ -118,7 +95,7 @@ jobs:
   package-ipa:
     name: Package IPA
     runs-on: ${{ env.RUNNER_IMAGE }}
-    needs: [build-sysroot, build-utm]
+    needs: build-utm
     steps:
       - name: Checkout
         uses: actions/checkout@v3
@@ -131,21 +108,12 @@ jobs:
         with:
           name: UTM.xcarchive
 
-      - name: Determine package mode
-        id: mode
-        run: |
-          case "${{ github.event.inputs.scheme }}" in
-            iOS)        echo "mode=ipa" >> "$GITHUB_OUTPUT" ; echo "name=UTM.ipa" >> "$GITHUB_OUTPUT" ;;
-            iOS-SE)     echo "mode=ipa-se" >> "$GITHUB_OUTPUT" ; echo "name=UTM-SE.ipa" >> "$GITHUB_OUTPUT" ;;
-            iOS-Remote) echo "mode=ipa-remote" >> "$GITHUB_OUTPUT" ; echo "name=UTM-Remote.ipa" >> "$GITHUB_OUTPUT" ;;
-          esac
-
       - name: Package unsigned IPA
         run: |
-          ./scripts/package.sh ${{ steps.mode.outputs.mode }} UTM.xcarchive .
+          ./scripts/package.sh ipa UTM.xcarchive .
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.mode.outputs.name }}
-          path: ${{ steps.mode.outputs.name }}
+          name: UTM.ipa
+          path: UTM.ipa
