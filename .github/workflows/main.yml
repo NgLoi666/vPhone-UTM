@@ -6,8 +6,8 @@ env:
   BUILD_XCODE_PATH: /Applications/Xcode_26.0.app
 
 jobs:
-  build-sysroot-vphone:
-    name: Build Sysroot (vPhone)
+  vphone-sysroot:
+    name: vPhone Sysroot
     runs-on: macos-15
     steps:
       - name: Checkout
@@ -55,10 +55,10 @@ jobs:
           key: ios-arm64-${{ hashFiles('scripts/build_dependencies.sh') }}-${{ hashFiles('patches/**') }}-${{ github.sha }}
           upload-chunk-size: 1048576
 
-  build-utm-vphone:
-    name: Build vPhone UTM
+  vphone-build:
+    name: vPhone Build
     runs-on: macos-15
-    needs: build-sysroot-vphone
+    needs: vphone-sysroot
     steps:
       - name: Checkout
         uses: actions/checkout@v3
@@ -88,13 +88,13 @@ jobs:
       - name: Upload xcarchive
         uses: actions/upload-artifact@v4
         with:
-          name: UTM.xcarchive
+          name: vPhone-UTM.xcarchive
           path: UTM.xcarchive
 
-  package-ipa-vphone:
-    name: Package IPA (vPhone)
+  vphone-package:
+    name: vPhone Package
     runs-on: macos-15
-    needs: build-utm-vphone
+    needs: vphone-build
     steps:
       - name: Checkout
         uses: actions/checkout@v3
@@ -105,7 +105,7 @@ jobs:
       - name: Download xcarchive
         uses: actions/download-artifact@v4
         with:
-          name: UTM.xcarchive
+          name: vPhone-UTM.xcarchive
 
       - name: Package unsigned IPA
         run: |
@@ -114,5 +114,5 @@ jobs:
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: UTM.ipa
+          name: vPhone-UTM.ipa
           path: UTM.ipa
