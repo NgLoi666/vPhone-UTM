@@ -9,7 +9,7 @@ env:
 jobs:
   build-sysroot:
     name: Build Sysroot
-    runs-on: ${{ env.RUNNER_IMAGE }}
+    runs-on: macos-15
     steps:
       - name: Checkout
         uses: actions/checkout@v3
