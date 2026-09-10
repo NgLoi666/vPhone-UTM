@@ -4,7 +4,6 @@ on:
 
 env:
   BUILD_XCODE_PATH: /Applications/Xcode_26.0.app
-  RUNNER_IMAGE: macos-15
 
 jobs:
   build-sysroot:
@@ -34,6 +33,89 @@ jobs:
         shell: bash
         run: |
           echo "/usr/local/opt/bison/bin:/opt/homebrew/opt/bison/bin" >> $GITHUB_PATH
+
+      - name: Install Requirements
+        if: steps.cache-sysroot.outputs.cache-matched-key == ''
+        run: |
+          brew uninstall cmake
+          brew install bison pkg-config gettext glib-utils libgpg-error nasm make meson cmake
+          brew install llvm spirv-llvm-translator libxcb libxrandr
+          python3 -m pip install --user six pyparsing pyyaml setuptools distlib mako
+          rm -f /usr/local/lib/pkgconfig/*.pc
+
+      - name: Build Sysroot
+        if: steps.cache-sysroot.outputs.cache-matched-key == ''
+        run: ./scripts/build_dependencies.sh -p ios -a arm64
+
+      - name: Save Cache
+        if: steps.cache-sysroot.outputs.cache-matched-key == ''
+        uses: actions/cache/save@v4
+        with:
+          path: ./sysroot-ios-arm64
+          key: ios-arm64-${{ hashFiles('scripts/build_dependencies.sh') }}-${{ hashFiles('patches/**') }}-${{ github.sha }}
+          upload-chunk-size: 1048576
+
+  build-utm:
+    name: Build UTM
+    runs-on: macos-15
+    needs: build-sysroot
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          submodules: recursive
+
+      - name: Setup Xcode
+        shell: bash
+        run: |
+          [[ "$(xcode-select -p)" == "${{ env.BUILD_XCODE_PATH }}"* ]] || sudo xcode-select -s "${{ env.BUILD_XCODE_PATH }}"
+
+      - name: Restore Sysroot Cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ./sysroot-ios-arm64
+          key: ios-arm64-${{ hashFiles('scripts/build_dependencies.sh') }}-${{ hashFiles('patches/**') }}-${{ github.sha }}
+          fail-on-cache-miss: true
+
+      - name: Build
+        run: |
+          ./scripts/build_utm.sh \
+            -k iphoneos \
+            -s iOS \
+            -a arm64 \
+            -o UTM
+
+      - name: Upload xcarchive
+        uses: actions/upload-artifact@v4
+        with:
+          name: UTM.xcarchive
+          path: UTM.xcarchive
+
+  package-ipa:
+    name: Package IPA
+    runs-on: macos-15
+    needs: build-utm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Install ldid
+        run: brew install ldid
+
+      - name: Download xcarchive
+        uses: actions/download-artifact@v4
+        with:
+          name: UTM.xcarchive
+
+      - name: Package unsigned IPA
+        run: |
+          ./scripts/package.sh ipa UTM.xcarchive .
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: UTM.ipa
+          path: UTM.ipa
 
       - name: Install Requirements
         if: steps.cache-sysroot.outputs.cache-matched-key == ''
